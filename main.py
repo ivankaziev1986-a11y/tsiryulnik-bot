@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from typing import Optional, Set, Dict, Any, List
+from typing import Dict, List
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -51,25 +51,13 @@ SALONS: Dict[str, Dict[str, str]] = {
 }
 VK_LINK = "https://vk.com/salonseverodvinsk"
 
-# ========= Категории жалобы =========
-CATEGORIES: List[str] = [
-    "Грубое общение",
-    "Необработанный инструмент",
-    "Грязное рабочее место",
-    "Плохое качество услуги",
-    "Нарушение времени записи",
-    "Другое",
-]
-
 # ========= Состояния =========
 class Flow(StatesGroup):
     feedback_type = State()   # 'negative' | 'positive'
     salon = State()           # 's1' | 's2' | 's3'
-    master_info = State()     # свободный ввод: имя сотрудника или расположение рабочего места
-    cats = State()            # выбор категорий (инлайн чекбоксы)
-    desc = State()            # описание + медиа, завершается словом "Готово"
-    phone = State()           # получить контакт или "Пропустить"
-    consent = State()         # согласие на звонок (Да/Нет)
+    master_info = State()     # имя сотрудника или расположение рабочего места
+    description = State()     # краткое описание (1–2 предложения) + (опц.) медиа
+    phone = State()           # ввод/шаринг телефона или Пропустить
 
 # ========= Кнопки / UI =========
 def action_kb():
@@ -107,16 +95,7 @@ def contact_share_kb() -> ReplyKeyboardMarkup:
         selective=True,
     )
 
-def categories_kb(selected: Set[str]):
-    kb = InlineKeyboardBuilder()
-    for idx, c in enumerate(CATEGORIES):
-        mark = "✅ " if c in selected else ""
-        kb.button(text=f"{mark}{c}", callback_data=f"cat:{idx}")
-    kb.button(text="Готово", callback_data="cat:done")
-    kb.adjust(1)
-    return kb.as_markup()
-
-# ========= Помощники =========
+# ========= Хелперы =========
 async def admin_log(text: str):
     if ADMIN_CHAT_ID:
         try:
@@ -131,16 +110,13 @@ def get_username(u) -> str:
 @dp.message(CommandStart())
 async def on_start(message: Message, state: FSMContext):
     """
-    Сначала спрашиваем действие. Если есть deep-link /start s2 — запоминаем салон,
-    но всё равно сперва показываем выбор действия (требование п.1).
+    1) Сначала действие (Жалоба/Отзыв)
+    2) Затем выбор салона (учитываем deep-link /start s1|s2|s3)
     """
     await state.clear()
-    # deep-link: /start s1|s2|s3
     payload = message.text.split(maxsplit=1)
-    if len(payload) == 2:
-        arg = payload[1].strip()
-        if arg in SALONS:
-            await state.update_data(salon=arg)
+    if len(payload) == 2 and payload[1].strip() in SALONS:
+        await state.update_data(salon=payload[1].strip())
 
     await message.answer("Что вы хотите сделать?", reply_markup=action_kb())
     await state.set_state(Flow.feedback_type)
@@ -154,7 +130,6 @@ async def on_pick_type(cb: CallbackQuery, state: FSMContext):
     preselected = data.get("salon")
 
     if preselected:
-        # Салон уже известен из deep-link
         if typ == "positive":
             await cb.message.edit_text(
                 f"Салон: <b>{SALONS[preselected]['name']}</b>\n"
@@ -162,14 +137,15 @@ async def on_pick_type(cb: CallbackQuery, state: FSMContext):
                 reply_markup=praise_links_kb(preselected),
                 disable_web_page_preview=True,
             )
-            await admin_log(f"👍 Похвала\nСалон: {SALONS[preselected]['name']}\nПользователь: {get_username(cb.from_user)}")
+            await admin_log(
+                f"👍 Похвала\nСалон: {SALONS[preselected]['name']}\nПользователь: {get_username(cb.from_user)}"
+            )
         else:
             await cb.message.edit_text(
                 "Укажите имя сотрудника или напишите расположение его рабочего места."
             )
             await state.set_state(Flow.master_info)
     else:
-        # Нужно выбрать салон
         await cb.message.edit_text("Выберите салон:", reply_markup=salons_kb())
         await state.set_state(Flow.salon)
 
@@ -189,7 +165,9 @@ async def on_pick_salon(cb: CallbackQuery, state: FSMContext):
             reply_markup=praise_links_kb(salon_key),
             disable_web_page_preview=True,
         )
-        await admin_log(f"👍 Похвала\nСалон: {SALONS[salon_key]['name']}\nПользователь: {get_username(cb.from_user)}")
+        await admin_log(
+            f"👍 Похвала\nСалон: {SALONS[salon_key]['name']}\nПользователь: {get_username(cb.from_user)}"
+        )
     else:
         await cb.message.edit_text(
             "Укажите имя сотрудника или напишите расположение его рабочего места."
@@ -218,135 +196,77 @@ async def on_praise_done(cb: CallbackQuery, state: FSMContext):
 async def on_master_info(message: Message, state: FSMContext):
     """
     Свободный ввод: имя сотрудника ИЛИ расположение рабочего места.
-    Далее — мультивыбор категорий (инлайн чекбоксы).
+    Далее — сразу описание (1–2 предложения), без шага категорий и без слова «Готово».
     """
     info = (message.text or "").strip()
     await state.update_data(master_info=info)
 
     await message.answer(
-        "Выберите категории проблемы (можно несколько), затем нажмите «Готово».",
-        reply_markup=categories_kb(set())
+        "Опишите, пожалуйста, ситуацию в 1–2 предложениях. "
+        "Можно прикрепить фото/видео (не обязательно)."
     )
-    await state.set_state(Flow.cats)
+    await state.set_state(Flow.description)
 
-@dp.callback_query(Flow.cats, F.data.startswith("cat:"))
-async def on_toggle_category(cb: CallbackQuery, state: FSMContext):
-    code = cb.data.split(":", 1)[1]
-    data = await state.get_data()
-    selected: Set[str] = set(data.get("cats", []))
+@dp.message(Flow.description)
+async def on_description(message: Message, state: FSMContext):
+    """
+    Принимаем первое осмысленное описание + (опционально) одно вложение,
+    сразу переходим к запросу телефона (без «Готово»).
+    """
+    desc = (message.caption or message.text or "").strip()
+    media = None
+    if message.photo:
+        media = f"photo:{message.photo[-1].file_id}"
+    elif message.video:
+        media = f"video:{message.video.file_id}"
+    elif message.document:
+        media = f"doc:{message.document.file_id}"
 
-    if code == "done":
-        # Переходим к описанию/медиа
-        await cb.message.edit_text(
-            "Опишите ситуацию (1–2 предложения). Можно прикрепить фото/видео.\n\n"
-            "Когда закончите, отправьте сообщение словом: <b>Готово</b>."
-        )
-        await state.set_state(Flow.desc)
-        await cb.answer()
-        return
+    await state.update_data(desc_text=desc, media=[media] if media else [])
 
-    # Переключаем пункт
-    try:
-        idx = int(code)
-        if 0 <= idx < len(CATEGORIES):
-            cat = CATEGORIES[idx]
-            if cat in selected:
-                selected.remove(cat)
-            else:
-                selected.add(cat)
-    except ValueError:
-        pass
-
-    await state.update_data(cats=list(selected))
-    await cb.message.edit_reply_markup(categories_kb(selected))
-    await cb.answer()
-
-# ---- сбор описания/медиа до слова "Готово"
-@dp.message(Flow.desc, F.text.lower() == "готово")
-async def on_desc_done(message: Message, state: FSMContext):
     await message.answer(
-        "Оставьте номер телефона (по желанию).",
-        reply_markup=contact_share_kb()
+        "Оставьте, пожалуйста, контактный номер телефона, чтобы мы могли связаться и решить вопрос.\n\n"
+        "<i>Указывая телефон, вы даёте согласие на звонок от управляющего.</i>",
+        reply_markup=contact_share_kb(),
     )
     await state.set_state(Flow.phone)
-
-@dp.message(Flow.desc)
-async def on_desc_collect(message: Message, state: FSMContext):
-    data = await state.get_data()
-    desc = data.get("desc_text", "")
-    media = data.get("media", [])
-
-    # Медиа
-    if message.photo:
-        media.append(f"photo:{message.photo[-1].file_id}")
-    elif message.video:
-        media.append(f"video:{message.video.file_id}")
-    elif message.document:
-        media.append(f"doc:{message.document.file_id}")
-
-    # Текст / подпись
-    part = message.caption or message.text or ""
-    if part and part.lower() != "готово":
-        desc = (desc + "\n" + part).strip()
-
-    await state.update_data(desc_text=desc, media=media)
 
 # ---- телефон: поделиться/пропустить/ввести
 @dp.message(Flow.phone, F.contact)
 async def on_phone_contact(message: Message, state: FSMContext):
-    await state.update_data(phone=message.contact.phone_number)
-    await ask_consent(message, state)
+    await finalize_complaint(message, state, phone=message.contact.phone_number)
 
 @dp.message(Flow.phone, F.text.casefold() == "пропустить")
 async def on_phone_skip(message: Message, state: FSMContext):
-    await state.update_data(phone=None)
-    await ask_consent(message, state)
+    await finalize_complaint(message, state, phone=None)
 
 @dp.message(Flow.phone)
 async def on_phone_text(message: Message, state: FSMContext):
-    await state.update_data(phone=(message.text or "").strip())
-    await ask_consent(message, state)
+    await finalize_complaint(message, state, phone=(message.text or "").strip())
 
-async def ask_consent(message: Message, state: FSMContext):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Да", callback_data="cons:yes")
-    kb.button(text="Нет", callback_data="cons:no")
-    kb.adjust(2)
-    await message.answer(
-        "Согласны ли вы на звонок от управляющего для решения вопроса?",
-        reply_markup=kb.as_markup(),
-    )
-    await state.set_state(Flow.consent)
-
-@dp.callback_query(Flow.consent, F.data.startswith("cons:"))
-async def on_consent(cb: CallbackQuery, state: FSMContext):
-    consent = cb.data.endswith("yes")
+async def finalize_complaint(message: Message, state: FSMContext, phone: str | None):
     data = await state.get_data()
-
     salon_key = data.get("salon")
     salon_name = SALONS[salon_key]["name"] if salon_key else "—"
-    cats = ", ".join(data.get("cats", [])) or "—"
+    consent = bool(phone)  # телефон указан => согласие на звонок: Да
 
     log = (
         "🚨 Жалоба\n"
         f"Салон: {salon_name}\n"
         f"Сотрудник/место: {data.get('master_info') or '—'}\n"
-        f"Категории: {cats}\n"
         f"Описание: {data.get('desc_text') or '—'}\n"
-        f"Медиа: {len(data.get('media', []))} влож.\n"
-        f"Телефон: {data.get('phone') or '—'}\n"
+        f"Медиа: {1 if data.get('media') else 0} влож.\n"
+        f"Телефон: {phone or '—'}\n"
         f"Согласие на звонок: {'Да' if consent else 'Нет'}\n"
-        f"Пользователь: {get_username(cb.from_user)}"
+        f"Пользователь: {get_username(message.from_user)}"
     )
     await admin_log(log)
 
-    await cb.message.edit_text(
-        "Спасибо! Ваша жалоба зафиксирована. Управляющий свяжется с вами в течение 24 часов."
-        if consent else
-        "Спасибо! Жалоба зафиксирована. Мы разберёмся."
+    await message.answer(
+        "Спасибо! Ваша жалоба зафиксирована. "
+        + ("Управляющий свяжется с вами в ближайшее время." if consent else "Мы разберёмся по факту обращения.")
     )
     await state.clear()
-    await cb.answer()
 
 # ========= Help =========
 @dp.message(Command("help"))
