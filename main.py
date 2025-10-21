@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from typing import Optional
+from typing import Optional, Set, Dict, Any, List
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -18,21 +18,21 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiohttp import web
 
-# === Настройки ===
+# ========= Конфиг из переменных окружения =========
 BOT_TOKEN = "8149079701:AAEFH-usiimRlsH0FYFqIeTVRhLCTwdSL9E"
 ADMIN_CHAT_ID = -4956523911
 BOT_USERNAME = "tsiryulnik_feedback_bot"
 
-# === Логирование ===
+# ========= Логирование =========
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("tsiryulnik-bot")
 
-# === Инициализация бота и диспетчера ===
+# ========= Инициализация бота =========
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# === Список салонов ===
-salons = {
+# ========= Данные салонов =========
+SALONS: Dict[str, Dict[str, str]] = {
     "s1": {
         "name": "Ломоносова, 85/1",
         "yandex": "https://yandex.ru/maps/-/CLbM5BiA",
@@ -49,166 +49,343 @@ salons = {
         "gis": "https://go.2gis.com/PJtRI",
     },
 }
-
 VK_LINK = "https://vk.com/salonseverodvinsk"
 
-# === Машина состояний ===
-class FeedbackForm(StatesGroup):
-    salon = State()
-    feedback_type = State()
-    master_name = State()
-    issue_text = State()
-    phone = State()
-    consent = State()
+# ========= Категории жалобы =========
+CATEGORIES: List[str] = [
+    "Грубое общение",
+    "Необработанный инструмент",
+    "Грязное рабочее место",
+    "Плохое качество услуги",
+    "Нарушение времени записи",
+    "Другое",
+]
 
+# ========= Состояния =========
+class Flow(StatesGroup):
+    feedback_type = State()   # 'negative' | 'positive'
+    salon = State()           # 's1' | 's2' | 's3'
+    master_info = State()     # свободный ввод: имя сотрудника или расположение рабочего места
+    cats = State()            # выбор категорий (инлайн чекбоксы)
+    desc = State()            # описание + медиа, завершается словом "Готово"
+    phone = State()           # получить контакт или "Пропустить"
+    consent = State()         # согласие на звонок (Да/Нет)
 
-# === Команда /start ===
-@dp.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    builder = InlineKeyboardBuilder()
-    for key, s in salons.items():
-        builder.button(text=s["name"], callback_data=f"salon_{key}")
-    await message.answer(
-        "Выберите салон, где вы были:",
-        reply_markup=builder.as_markup(),
-    )
-    await state.set_state(FeedbackForm.salon)
+# ========= Кнопки / UI =========
+def action_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Оставить жалобу", callback_data="type:negative")
+    kb.button(text="Оставить положительный отзыв", callback_data="type:positive")
+    kb.adjust(1)
+    return kb.as_markup()
 
+def salons_kb():
+    kb = InlineKeyboardBuilder()
+    for key, s in SALONS.items():
+        kb.button(text=s["name"], callback_data=f"salon:{key}")
+    kb.adjust(1)
+    return kb.as_markup()
 
-# === Выбор салона ===
-@dp.callback_query(F.data.startswith("salon_"))
-async def choose_salon(callback: CallbackQuery, state: FSMContext):
-    salon_key = callback.data.split("_")[1]
-    await state.update_data(salon=salon_key)
+def praise_links_kb(salon_key: str):
+    s = SALONS[salon_key]
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🟡 Яндекс", url=s["yandex"])
+    kb.button(text="🟢 2ГИС", url=s["gis"])
+    kb.button(text="🔵 VK", url=VK_LINK)
+    kb.button(text="Готово, оставил(а)", callback_data="praise:done")
+    kb.adjust(1)
+    return kb.as_markup()
 
-    builder = InlineKeyboardBuilder()
-    builder.button(text="Оставить жалобу", callback_data="type_negative")
-    builder.button(text="Оставить положительный отзыв", callback_data="type_positive")
-
-    await callback.message.edit_text(
-        "Хотите оставить жалобу или положительный отзыв?",
-        reply_markup=builder.as_markup(),
-    )
-    await state.set_state(FeedbackForm.feedback_type)
-
-
-# === Ветка: положительный отзыв ===
-@dp.callback_query(F.data == "type_positive")
-async def positive_feedback(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    salon = salons[data["salon"]]
-    text = (
-        f"Спасибо за ваш отзыв!\n\n"
-        f"Пожалуйста, выберите площадку, где хотите его оставить:\n\n"
-        f"📍 {salon['name']}\n\n"
-        f"<a href='{salon['yandex']}'>🟡 Яндекс</a>\n"
-        f"<a href='{salon['gis']}'>🟢 2ГИС</a>\n"
-        f"<a href='{VK_LINK}'>🔵 ВКонтакте</a>"
-    )
-    await callback.message.edit_text(text, disable_web_page_preview=True)
-    await state.clear()
-
-
-# === Ветка: жалоба ===
-@dp.callback_query(F.data == "type_negative")
-async def negative_feedback(callback: CallbackQuery, state: FSMContext):
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Да"), KeyboardButton(text="Не помню")]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-    await callback.message.answer(
-        "Вы знаете имя мастера? (указано на бейджике)", reply_markup=kb
-    )
-    await state.set_state(FeedbackForm.master_name)
-
-
-@dp.message(FeedbackForm.master_name)
-async def process_master_name(message: Message, state: FSMContext):
-    name = message.text if message.text != "Не помню" else None
-    await state.update_data(master_name=name)
-
-    await message.answer(
-        "Пожалуйста, опишите проблему. Например:\n"
-        "— Грубое обращение\n— Плохое качество услуги\n— Грязное рабочее место\n— Необработанный инструмент",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Отменить")]], resize_keyboard=True
-        ),
-    )
-    await state.set_state(FeedbackForm.issue_text)
-
-
-@dp.message(FeedbackForm.issue_text)
-async def process_issue_text(message: Message, state: FSMContext):
-    if message.text.lower() == "отменить":
-        await message.answer("Отмена. Вы можете начать заново /start")
-        await state.clear()
-        return
-
-    await state.update_data(issue_text=message.text)
-    await message.answer("Оставьте, пожалуйста, свой номер телефона (или напишите «нет»).")
-    await state.set_state(FeedbackForm.phone)
-
-
-@dp.message(FeedbackForm.phone)
-async def process_phone(message: Message, state: FSMContext):
-    await state.update_data(phone=message.text)
-    kb = ReplyKeyboardMarkup(
+def contact_share_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Да, перезвоните мне")],
-            [KeyboardButton(text="Нет, только учтите мой отзыв")],
+            [KeyboardButton(text="📞 Поделиться номером", request_contact=True)],
+            [KeyboardButton(text="Пропустить")],
         ],
         resize_keyboard=True,
+        one_time_keyboard=True,
+        selective=True,
     )
-    await message.answer("Можно ли вам перезвонить для уточнения деталей?", reply_markup=kb)
-    await state.set_state(FeedbackForm.consent)
 
+def categories_kb(selected: Set[str]):
+    kb = InlineKeyboardBuilder()
+    for idx, c in enumerate(CATEGORIES):
+        mark = "✅ " if c in selected else ""
+        kb.button(text=f"{mark}{c}", callback_data=f"cat:{idx}")
+    kb.button(text="Готово", callback_data="cat:done")
+    kb.adjust(1)
+    return kb.as_markup()
 
-@dp.message(FeedbackForm.consent)
-async def process_consent(message: Message, state: FSMContext):
+# ========= Помощники =========
+async def admin_log(text: str):
+    if ADMIN_CHAT_ID:
+        try:
+            await bot.send_message(ADMIN_CHAT_ID, text)
+        except Exception as e:
+            logger.exception("Не удалось отправить лог в группу: %s", e)
+
+def get_username(u) -> str:
+    return f"@{u.username}" if getattr(u, "username", None) else f"id:{u.id}"
+
+# ========= Старт =========
+@dp.message(CommandStart())
+async def on_start(message: Message, state: FSMContext):
+    """
+    Сначала спрашиваем действие. Если есть deep-link /start s2 — запоминаем салон,
+    но всё равно сперва показываем выбор действия (требование п.1).
+    """
+    await state.clear()
+    # deep-link: /start s1|s2|s3
+    payload = message.text.split(maxsplit=1)
+    if len(payload) == 2:
+        arg = payload[1].strip()
+        if arg in SALONS:
+            await state.update_data(salon=arg)
+
+    await message.answer("Что вы хотите сделать?", reply_markup=action_kb())
+    await state.set_state(Flow.feedback_type)
+
+@dp.callback_query(Flow.feedback_type, F.data.startswith("type:"))
+async def on_pick_type(cb: CallbackQuery, state: FSMContext):
+    typ = cb.data.split(":", 1)[1]  # 'negative' / 'positive'
+    await state.update_data(feedback_type=typ)
+
     data = await state.get_data()
-    salon = salons[data["salon"]]
+    preselected = data.get("salon")
 
-    complaint = (
-        f"⚠️ <b>Новая жалоба</b>\n\n"
-        f"🏠 Салон: {salon['name']}\n"
-        f"👤 Мастер: {data.get('master_name', 'Не указано')}\n"
-        f"📄 Описание: {data.get('issue_text')}\n"
-        f"📞 Телефон: {data.get('phone')}\n"
-        f"☑️ Согласие на звонок: {message.text}\n"
+    if preselected:
+        # Салон уже известен из deep-link
+        if typ == "positive":
+            await cb.message.edit_text(
+                f"Салон: <b>{SALONS[preselected]['name']}</b>\n"
+                f"Выберите площадку для отзыва:",
+                reply_markup=praise_links_kb(preselected),
+                disable_web_page_preview=True,
+            )
+            await admin_log(f"👍 Похвала\nСалон: {SALONS[preselected]['name']}\nПользователь: {get_username(cb.from_user)}")
+        else:
+            await cb.message.edit_text(
+                "Укажите имя сотрудника или напишите расположение его рабочего места."
+            )
+            await state.set_state(Flow.master_info)
+    else:
+        # Нужно выбрать салон
+        await cb.message.edit_text("Выберите салон:", reply_markup=salons_kb())
+        await state.set_state(Flow.salon)
+
+    await cb.answer()
+
+@dp.callback_query(Flow.salon, F.data.startswith("salon:"))
+async def on_pick_salon(cb: CallbackQuery, state: FSMContext):
+    salon_key = cb.data.split(":", 1)[1]
+    await state.update_data(salon=salon_key)
+    data = await state.get_data()
+    typ = data.get("feedback_type")
+
+    if typ == "positive":
+        await cb.message.edit_text(
+            f"Салон: <b>{SALONS[salon_key]['name']}</b>\n"
+            f"Выберите площадку для отзыва:",
+            reply_markup=praise_links_kb(salon_key),
+            disable_web_page_preview=True,
+        )
+        await admin_log(f"👍 Похвала\nСалон: {SALONS[salon_key]['name']}\nПользователь: {get_username(cb.from_user)}")
+    else:
+        await cb.message.edit_text(
+            "Укажите имя сотрудника или напишите расположение его рабочего места."
+        )
+        await state.set_state(Flow.master_info)
+
+    await cb.answer()
+
+# ========= Ветка: Положительный отзыв =========
+@dp.callback_query(F.data == "praise:done")
+async def on_praise_done(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    salon_key = data.get("salon")
+    salon_name = SALONS[salon_key]["name"] if salon_key else "—"
+    await admin_log(
+        "👍 Похвала (подтверждена)\n"
+        f"Салон: {salon_name}\n"
+        f"Пользователь: {get_username(cb.from_user)}"
     )
+    await cb.message.edit_text("Спасибо! Это очень помогает салону 💈")
+    await state.clear()
+    await cb.answer()
 
-    await bot.send_message(ADMIN_CHAT_ID, complaint)
+# ========= Ветка: Жалоба =========
+@dp.message(Flow.master_info)
+async def on_master_info(message: Message, state: FSMContext):
+    """
+    Свободный ввод: имя сотрудника ИЛИ расположение рабочего места.
+    Далее — мультивыбор категорий (инлайн чекбоксы).
+    """
+    info = (message.text or "").strip()
+    await state.update_data(master_info=info)
+
     await message.answer(
-        "Спасибо, что сообщили о проблеме. Мы обязательно разберёмся в ситуации 🙏",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="/start")]], resize_keyboard=True
-        ),
+        "Выберите категории проблемы (можно несколько), затем нажмите «Готово».",
+        reply_markup=categories_kb(set())
+    )
+    await state.set_state(Flow.cats)
+
+@dp.callback_query(Flow.cats, F.data.startswith("cat:"))
+async def on_toggle_category(cb: CallbackQuery, state: FSMContext):
+    code = cb.data.split(":", 1)[1]
+    data = await state.get_data()
+    selected: Set[str] = set(data.get("cats", []))
+
+    if code == "done":
+        # Переходим к описанию/медиа
+        await cb.message.edit_text(
+            "Опишите ситуацию (1–2 предложения). Можно прикрепить фото/видео.\n\n"
+            "Когда закончите, отправьте сообщение словом: <b>Готово</b>."
+        )
+        await state.set_state(Flow.desc)
+        await cb.answer()
+        return
+
+    # Переключаем пункт
+    try:
+        idx = int(code)
+        if 0 <= idx < len(CATEGORIES):
+            cat = CATEGORIES[idx]
+            if cat in selected:
+                selected.remove(cat)
+            else:
+                selected.add(cat)
+    except ValueError:
+        pass
+
+    await state.update_data(cats=list(selected))
+    await cb.message.edit_reply_markup(categories_kb(selected))
+    await cb.answer()
+
+# ---- сбор описания/медиа до слова "Готово"
+@dp.message(Flow.desc, F.text.lower() == "готово")
+async def on_desc_done(message: Message, state: FSMContext):
+    await message.answer(
+        "Оставьте номер телефона (по желанию).",
+        reply_markup=contact_share_kb()
+    )
+    await state.set_state(Flow.phone)
+
+@dp.message(Flow.desc)
+async def on_desc_collect(message: Message, state: FSMContext):
+    data = await state.get_data()
+    desc = data.get("desc_text", "")
+    media = data.get("media", [])
+
+    # Медиа
+    if message.photo:
+        media.append(f"photo:{message.photo[-1].file_id}")
+    elif message.video:
+        media.append(f"video:{message.video.file_id}")
+    elif message.document:
+        media.append(f"doc:{message.document.file_id}")
+
+    # Текст / подпись
+    part = message.caption or message.text or ""
+    if part and part.lower() != "готово":
+        desc = (desc + "\n" + part).strip()
+
+    await state.update_data(desc_text=desc, media=media)
+
+# ---- телефон: поделиться/пропустить/ввести
+@dp.message(Flow.phone, F.contact)
+async def on_phone_contact(message: Message, state: FSMContext):
+    await state.update_data(phone=message.contact.phone_number)
+    await ask_consent(message, state)
+
+@dp.message(Flow.phone, F.text.casefold() == "пропустить")
+async def on_phone_skip(message: Message, state: FSMContext):
+    await state.update_data(phone=None)
+    await ask_consent(message, state)
+
+@dp.message(Flow.phone)
+async def on_phone_text(message: Message, state: FSMContext):
+    await state.update_data(phone=(message.text or "").strip())
+    await ask_consent(message, state)
+
+async def ask_consent(message: Message, state: FSMContext):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Да", callback_data="cons:yes")
+    kb.button(text="Нет", callback_data="cons:no")
+    kb.adjust(2)
+    await message.answer(
+        "Согласны ли вы на звонок от управляющего для решения вопроса?",
+        reply_markup=kb.as_markup(),
+    )
+    await state.set_state(Flow.consent)
+
+@dp.callback_query(Flow.consent, F.data.startswith("cons:"))
+async def on_consent(cb: CallbackQuery, state: FSMContext):
+    consent = cb.data.endswith("yes")
+    data = await state.get_data()
+
+    salon_key = data.get("salon")
+    salon_name = SALONS[salon_key]["name"] if salon_key else "—"
+    cats = ", ".join(data.get("cats", [])) or "—"
+
+    log = (
+        "🚨 Жалоба\n"
+        f"Салон: {salon_name}\n"
+        f"Сотрудник/место: {data.get('master_info') or '—'}\n"
+        f"Категории: {cats}\n"
+        f"Описание: {data.get('desc_text') or '—'}\n"
+        f"Медиа: {len(data.get('media', []))} влож.\n"
+        f"Телефон: {data.get('phone') or '—'}\n"
+        f"Согласие на звонок: {'Да' if consent else 'Нет'}\n"
+        f"Пользователь: {get_username(cb.from_user)}"
+    )
+    await admin_log(log)
+
+    await cb.message.edit_text(
+        "Спасибо! Ваша жалоба зафиксирована. Управляющий свяжется с вами в течение 24 часов."
+        if consent else
+        "Спасибо! Жалоба зафиксирована. Мы разберёмся."
     )
     await state.clear()
+    await cb.answer()
 
+# ========= Help =========
+@dp.message(Command("help"))
+async def on_help(message: Message, state: FSMContext):
+    deep = "\n".join(
+        f"• {s['name']}: https://t.me/{BOT_USERNAME}?start={key}"
+        for key, s in SALONS.items()
+    )
+    await message.answer(
+        "Этот бот собирает жалобы и положительные отзывы.\n\n"
+        "Как пользоваться:\n"
+        "— /start → выберите действие (Жалоба/Отзыв)\n"
+        "— выберите салон\n"
+        "— следуйте подсказкам\n\n"
+        "Быстрые ссылки по салонам:\n" + deep
+    )
 
-# === Мини веб-сервер для аптайма ===
-async def handle(request):
-    return web.Response(text="Bot is running")
+# ========= Мини-вебсервер для аптайма =========
+async def handle(_):
+    return web.Response(text="OK")
 
-def setup_web_server():
+async def start_keepalive():
     app = web.Application()
     app.router.add_get("/", handle)
-    return app
-
-
-# === Главная точка входа ===
-async def main():
-    app = setup_web_server()
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()
+    logger.info("Keepalive web server running on :8080")
 
-    logger.info("✅ Бот запущен. Жалобы будут приходить сюда.")
-    await bot.send_message(ADMIN_CHAT_ID, "✅ Бот запущен. Жалобы будут приходить сюда.")
-    await dp.start_polling(bot)
+# ========= main =========
+async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
+    await admin_log("✅ Бот запущен. Жалобы/отзывы будут приходить сюда.")
+    await asyncio.gather(
+        dp.start_polling(bot),
+        start_keepalive(),
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
